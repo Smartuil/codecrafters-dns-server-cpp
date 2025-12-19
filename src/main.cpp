@@ -15,6 +15,7 @@
 #include <unistd.h>      // POSIX API：close() 函数
 #include <arpa/inet.h>   // htons(), ntohs() 等网络字节序转换函数
 #include <vector>        // std::vector 动态数组
+#include <string>        // std::string 字符串
 
 /**
  * DNS 消息头结构体（12 字节）
@@ -113,18 +114,163 @@ struct DNSHeader
 };
 
 /**
+ * DNS Question 结构体
+ * 
+ * Question Section 格式：
+ * +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+ * |                     NAME                      |  变长，域名编码
+ * +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+ * |                     TYPE                      |  16 bits，记录类型
+ * +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+ * |                     CLASS                     |  16 bits，记录类别
+ * +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+ * 
+ * 域名编码示例：
+ *   "codecrafters.io" 编码为：
+ *   \x0c codecrafters \x02 io \x00
+ *   ^^^^ ^^^^^^^^^^^^  ^^^  ^^  ^^
+ *   长度12  标签内容   长度2 标签 结束符
+ * 
+ *   完整字节序列: 0x0C 63 6F 64 65 63 72 61 66 74 65 72 73 02 69 6F 00
+ *                     c  o  d  e  c  r  a  f  t  e  r  s     i  o
+ */
+struct DNSQuestion 
+{
+    std::string name;    // 域名（如 "codecrafters.io"）
+    uint16_t type;       // 记录类型（1 = A 记录，5 = CNAME 等）
+    uint16_t qclass;     // 记录类别（1 = IN，互联网）
+    
+    /**
+     * 将域名编码为 DNS 标签序列
+     * 
+     * 编码规则：
+     *   1. 按 '.' 分割域名为多个标签
+     *   2. 每个标签格式：<长度字节><内容>
+     *   3. 以 \x00 结束
+     * 
+     * 示例: "codecrafters.io" -> \x0ccodecrafters\x02io\x00
+     * 
+     * 详细编码过程（以 "codecrafters.io" 为例）：
+     * 
+     *   输入: "codecrafters.io"
+     *         ^^^^^^^^^^^^^  ^^
+     *         第一个标签     第二个标签
+     * 
+     *   步骤1: 找到第一个 '.'，位置 pos=12
+     *          标签 "codecrafters"，长度=12 (0x0C)
+     *          输出: [0x0C, 'c','o','d','e','c','r','a','f','t','e','r','s']
+     * 
+     *   步骤2: 从 pos+1=13 开始，找下一个 '.'，未找到
+     *          处理最后一个标签 "io"，长度=2 (0x02)
+     *          输出: [0x02, 'i','o']
+     * 
+     *   步骤3: 添加结束符 \x00
+     * 
+     *   最终结果（十六进制）:
+     *   0C 63 6F 64 65 63 72 61 66 74 65 72 73 02 69 6F 00
+     *   ^^ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ ^^ ^^^^^ ^^
+     *   长度  c  o  d  e  c  r  a  f  t  e  r  s  长度 i  o  结束
+     *   =12                                       =2
+     */
+    static std::vector<uint8_t> encodeDomainName(const std::string& domain) 
+    {
+        std::vector<uint8_t> encoded;
+        size_t start = 0;
+        size_t pos = 0;
+        
+        // 按 '.' 分割域名
+        // 示例: domain = "codecrafters.io"
+        //       第一次循环: start=0, 找到 pos=12 ('.')
+        //       第二次循环: start=13, 找不到 '.', 退出循环
+        while ((pos = domain.find('.', start)) != std::string::npos) 
+        {
+            // 计算当前标签长度
+            // 示例: labelLen = 12 - 0 = 12
+            size_t labelLen = pos - start;
+            
+            // 添加长度字节
+            // 示例: encoded.push_back(12) -> encoded = [0x0C]
+            encoded.push_back(static_cast<uint8_t>(labelLen));
+            
+            // 添加标签内容
+            // 示例: 添加 "codecrafters" 的每个字符
+            //       encoded = [0x0C, 'c','o','d','e','c','r','a','f','t','e','r','s']
+            for (size_t i = start; i < pos; i++) 
+            {
+                encoded.push_back(static_cast<uint8_t>(domain[i]));
+            }
+            
+            // 移动到下一个标签的起始位置
+            // 示例: start = 12 + 1 = 13
+            start = pos + 1;
+        }
+        
+        // 处理最后一个标签（'.' 后面的部分）
+        // 示例: start=13, domain.length()=15
+        //       最后一个标签 "io", 长度=15-13=2
+        if (start < domain.length()) 
+        {
+            size_t labelLen = domain.length() - start;
+            encoded.push_back(static_cast<uint8_t>(labelLen));
+            for (size_t i = start; i < domain.length(); i++) 
+            {
+                encoded.push_back(static_cast<uint8_t>(domain[i]));
+            }
+        }
+        
+        // 添加结束符 \x00
+        // 最终: encoded = [0x0C, ..., 0x02, 'i', 'o', 0x00]
+        encoded.push_back(0x00);
+        
+        return encoded;
+    }
+    
+    /**
+     * 序列化 Question 为字节数组
+     */
+    std::vector<uint8_t> serialize() const 
+    {
+        std::vector<uint8_t> bytes;
+        
+        // 1. 编码域名
+        std::vector<uint8_t> encodedName = encodeDomainName(name);
+        bytes.insert(bytes.end(), encodedName.begin(), encodedName.end());
+        
+        // 2. TYPE（2 字节，大端序）
+        bytes.push_back((type >> 8) & 0xFF);
+        bytes.push_back(type & 0xFF);
+        
+        // 3. CLASS（2 字节，大端序）
+        bytes.push_back((qclass >> 8) & 0xFF);
+        bytes.push_back(qclass & 0xFF);
+        
+        return bytes;
+    }
+};
+
+/**
  * DNS 消息结构体
  * 包含 header、question、answer、authority、additional 五个部分
- * 目前只实现 header 部分
  */
 struct DNSMessage 
 {
     DNSHeader header;
-    // TODO: 后续添加 question, answer, authority, additional 部分
+    std::vector<DNSQuestion> questions;  // Question 部分（可包含多个问题）
+    // TODO: 后续添加 answer, authority, additional 部分
     
     std::vector<uint8_t> serialize() const 
     {
-        return header.serialize();
+        // 1. 序列化 Header
+        std::vector<uint8_t> bytes = header.serialize();
+        
+        // 2. 序列化所有 Questions
+        for (const auto& question : questions) 
+        {
+            std::vector<uint8_t> questionBytes = question.serialize();
+            bytes.insert(bytes.end(), questionBytes.begin(), questionBytes.end());
+        }
+        
+        return bytes;
     }
 };
 
@@ -229,10 +375,10 @@ int main()
         std::cout << "Received " << bytesRead << " bytes" << std::endl;
 
         // ---------- 5.2 构建 DNS 响应 ----------
-        // 创建 DNS 响应消息
+        // 使用 DNSMessage 统一管理响应
         DNSMessage response;
         
-        // 设置 Header 字段
+        // ===== 设置 Header =====
         response.header.id = 1234;      // 包标识符（测试期望值：1234）
         
         // 构建 flags 字段（16 bits）：
@@ -254,12 +400,19 @@ int main()
                                 (tc << 9) | (rd << 8) | (ra << 7) | 
                                 (z << 4) | rcode;
         
-        response.header.qdcount = 0;    // 问题数：0
+        response.header.qdcount = 1;    // 问题数：1
         response.header.ancount = 0;    // 回答数：0
         response.header.nscount = 0;    // 授权记录数：0
         response.header.arcount = 0;    // 附加记录数：0
         
-        // 序列化为字节数组
+        // ===== 添加 Question =====
+        DNSQuestion question;
+        question.name = "codecrafters.io";  // 域名
+        question.type = 1;                   // TYPE = 1 (A 记录)
+        question.qclass = 1;                 // CLASS = 1 (IN，互联网)
+        response.questions.push_back(question);
+        
+        // ===== 序列化响应 =====
         std::vector<uint8_t> responseBytes = response.serialize();
 
         // ---------- 5.3 发送 DNS 响应 ----------
