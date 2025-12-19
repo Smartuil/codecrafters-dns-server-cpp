@@ -13,6 +13,120 @@
 #include <sys/socket.h>  // Socket API：socket(), bind(), sendto(), recvfrom()
 #include <netinet/in.h>  // Internet 地址结构体：sockaddr_in, htons(), htonl()
 #include <unistd.h>      // POSIX API：close() 函数
+#include <arpa/inet.h>   // htons(), ntohs() 等网络字节序转换函数
+#include <vector>        // std::vector 动态数组
+
+/**
+ * DNS 消息头结构体（12 字节）
+ * 
+ * DNS Header 格式（RFC 1035）：
+ * +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+ * |                      ID                       |  16 bits
+ * +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+ * |QR|   OPCODE  |AA|TC|RD|RA|   Z    |   RCODE   |  16 bits
+ * +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+ * |                    QDCOUNT                    |  16 bits
+ * +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+ * |                    ANCOUNT                    |  16 bits
+ * +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+ * |                    NSCOUNT                    |  16 bits
+ * +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+ * |                    ARCOUNT                    |  16 bits
+ * +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+ */
+struct DNSHeader 
+{
+    uint16_t id;        // 包标识符，响应必须与查询相同
+    
+    // |QR(1)|OPCODE(4)|AA(1)|TC(1)|RD(1)|RA(1)|Z(3)|RCODE(4)|
+    // |  1  |  0000   |  0  |  0  |  0  |  0  | 000|  0000  |
+    // 第二个 16 位字段包含多个标志位
+    uint16_t flags;     // QR(1) + OPCODE(4) + AA(1) + TC(1) + RD(1) + RA(1) + Z(3) + RCODE(4)
+    
+    uint16_t qdcount;   // Question Count: 问题部分的条目数
+    uint16_t ancount;   // Answer Count: 回答部分的记录数
+    uint16_t nscount;   // Authority Count: 授权部分的记录数
+    uint16_t arcount;   // Additional Count: 附加部分的记录数
+    
+    /**
+     * 将 DNS Header 序列化为字节数组（网络字节序，大端）
+     * 
+     * 大端序 vs 小端序示例（以 id = 1234 = 0x04D2 为例）：
+     *   - 大端序（网络字节序）: [0x04, 0xD2] 高位字节在前，人类阅读顺序
+     *   - 小端序（x86 架构）:   [0xD2, 0x04] 低位字节在前
+     * 
+     * 网络协议统一使用大端序，所以需要转换。
+     * 
+     * 序列化后的 12 字节数组布局：
+     *   索引:  [0]   [1]   [2]   [3]   [4]   [5]   [6]   [7]   [8]   [9]  [10]  [11]
+     *   字段:  |--ID---|  |-flags-|  |qdcount|  |ancount|  |nscount|  |arcount|
+     *   示例:  0x04  0xD2  0x80  0x00  0x00  0x00  0x00  0x00  0x00  0x00  0x00  0x00
+     *         (id=1234)  (QR=1)   (0)       (0)       (0)       (0)
+     */
+    std::vector<uint8_t> serialize() const 
+    {
+        // 创建 12 字节的数组，所有元素初始化为 0
+        // DNS Header 固定 12 字节: ID(2) + Flags(2) + QDCOUNT(2) + ANCOUNT(2) + NSCOUNT(2) + ARCOUNT(2)
+        std::vector<uint8_t> bytes(12);
+        
+        // ========== ID（16 bits）- 转换为大端序 ==========
+        // 示例: id = 1234 = 0x04D2
+        // 
+        // 提取高字节 (id >> 8) & 0xFF:
+        //   1. id = 0x04D2 = 0000 0100 1101 0010 (二进制)
+        //   2. id >> 8     = 0000 0000 0000 0100 (右移8位，高8位移到低8位)
+        //   3. & 0xFF      = 0000 0000 0000 0100 = 0x04 (掩码保留低8位)
+        // 
+        // 提取低字节 id & 0xFF:
+        //   1. id = 0x04D2 = 0000 0100 1101 0010 (二进制)
+        //   2. & 0xFF      = 0000 0000 1101 0010 = 0xD2 (掩码保留低8位)
+        // 
+        // 结果: bytes[0]=0x04, bytes[1]=0xD2 (大端序：高字节在前)
+        bytes[0] = (id >> 8) & 0xFF;   // 高字节: 右移8位取高8位
+        bytes[1] = id & 0xFF;          // 低字节: 直接取低8位
+        
+        // ========== Flags（16 bits）- 转换为大端序 ==========
+        // 示例: flags = 0x8000 (QR=1, 其余为0)
+        //   bytes[2] = (0x8000 >> 8) & 0xFF = 0x80
+        //   bytes[3] = 0x8000 & 0xFF = 0x00
+        bytes[2] = (flags >> 8) & 0xFF;
+        bytes[3] = flags & 0xFF;
+        
+        // ========== QDCOUNT（16 bits）==========
+        bytes[4] = (qdcount >> 8) & 0xFF;
+        bytes[5] = qdcount & 0xFF;
+        
+        // ========== ANCOUNT（16 bits）==========
+        bytes[6] = (ancount >> 8) & 0xFF;
+        bytes[7] = ancount & 0xFF;
+        
+        // ========== NSCOUNT（16 bits）==========
+        bytes[8] = (nscount >> 8) & 0xFF;
+        bytes[9] = nscount & 0xFF;
+        
+        // ========== ARCOUNT（16 bits）==========
+        bytes[10] = (arcount >> 8) & 0xFF;
+        bytes[11] = arcount & 0xFF;
+        
+        return bytes;
+    }
+};
+
+/**
+ * DNS 消息结构体
+ * 包含 header、question、answer、authority、additional 五个部分
+ * 目前只实现 header 部分
+ */
+struct DNSMessage 
+{
+    DNSHeader header;
+    // TODO: 后续添加 question, answer, authority, additional 部分
+    
+    std::vector<uint8_t> serialize() const 
+    {
+        return header.serialize();
+    }
+};
 
 int main() 
 {
@@ -112,28 +226,52 @@ int main()
 
         // 添加字符串结束符（仅用于调试打印，DNS 数据是二进制的）
         buffer[bytesRead] = '\0';
-        std::cout << "Received " << bytesRead << " bytes: " << buffer << std::endl;
+        std::cout << "Received " << bytesRead << " bytes" << std::endl;
 
         // ---------- 5.2 构建 DNS 响应 ----------
-        // TODO: 这里需要实现真正的 DNS 响应逻辑
-        // 目前只返回一个空字节，这不是有效的 DNS 响应
-        // 
-        // 完整的 DNS 响应应包含：
-        //   - Header（12 字节）：包含 ID、标志、各部分计数
-        //   - Question Section：原样复制查询中的问题
-        //   - Answer Section：包含查询结果（IP 地址等）
-        char response[1] = { '\0' };
+        // 创建 DNS 响应消息
+        DNSMessage response;
+        
+        // 设置 Header 字段
+        response.header.id = 1234;      // 包标识符（测试期望值：1234）
+        
+        // 构建 flags 字段（16 bits）：
+        // QR(1) | OPCODE(4) | AA(1) | TC(1) | RD(1) | RA(1) | Z(3) | RCODE(4)
+        //   1   |   0000    |   0   |   0   |   0   |   0   | 000  |  0000
+        // = 1000 0000 0000 0000 = 0x8000
+        uint16_t qr = 1;        // QR = 1 表示这是响应包
+        uint16_t opcode = 0;    // OPCODE = 0 标准查询
+        uint16_t aa = 0;        // AA = 0 非权威回答
+        uint16_t tc = 0;        // TC = 0 未截断
+        uint16_t rd = 0;        // RD = 0 不需要递归
+        uint16_t ra = 0;        // RA = 0 不支持递归
+        uint16_t z = 0;         // Z = 0 保留字段
+        uint16_t rcode = 0;     // RCODE = 0 无错误
+        
+        // 按位组合 flags
+        // |QR(1)|OPCODE(4)|AA(1)|TC(1)|RD(1)|RA(1)|Z(3)|RCODE(4)|
+        response.header.flags = (qr << 15) | (opcode << 11) | (aa << 10) | 
+                                (tc << 9) | (rd << 8) | (ra << 7) | 
+                                (z << 4) | rcode;
+        
+        response.header.qdcount = 0;    // 问题数：0
+        response.header.ancount = 0;    // 回答数：0
+        response.header.nscount = 0;    // 授权记录数：0
+        response.header.arcount = 0;    // 附加记录数：0
+        
+        // 序列化为字节数组
+        std::vector<uint8_t> responseBytes = response.serialize();
 
         // ---------- 5.3 发送 DNS 响应 ----------
         // sendto() 向指定地址发送 UDP 数据
         // 参数说明：
         //   - udpSocket: 发送数据的 socket
-        //   - response: 要发送的数据
-        //   - sizeof(response): 数据长度
+        //   - responseBytes.data(): 要发送的数据指针
+        //   - responseBytes.size(): 数据长度（12 字节）
         //   - 0: 标志位
         //   - clientAddress: 目标地址（即发送查询的客户端）
         //   - sizeof(clientAddress): 地址结构体大小
-        if (sendto(udpSocket, response, sizeof(response), 0, 
+        if (sendto(udpSocket, responseBytes.data(), responseBytes.size(), 0, 
                    reinterpret_cast<struct sockaddr*>(&clientAddress), sizeof(clientAddress)) == -1) 
         {
             perror("Failed to send response");
