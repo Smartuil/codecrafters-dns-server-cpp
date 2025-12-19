@@ -645,6 +645,46 @@ struct DNSAnswer
     std::vector<uint8_t> rdata;  // 记录数据（A 记录为 4 字节 IP 地址）
     
     /**
+     * 从字节数组解析 DNS Answer（反序列化）
+     * 
+     * @param data 完整的 DNS 消息数据
+     * @param offset [输入/输出] 当前解析位置
+     * @return 解析后的 DNSAnswer
+     */
+    static DNSAnswer parse(const uint8_t* data, size_t& offset)
+    {
+        DNSAnswer answer;
+        
+        // 1. 解析域名（支持压缩）
+        answer.name = DNSQuestion::parseDomainName(data, offset);
+        
+        // 2. TYPE（2 字节，大端序）
+        answer.type = (static_cast<uint16_t>(data[offset]) << 8) | data[offset + 1];
+        offset += 2;
+        
+        // 3. CLASS（2 字节，大端序）
+        answer.aclass = (static_cast<uint16_t>(data[offset]) << 8) | data[offset + 1];
+        offset += 2;
+        
+        // 4. TTL（4 字节，大端序）
+        answer.ttl = (static_cast<uint32_t>(data[offset]) << 24) |
+                     (static_cast<uint32_t>(data[offset + 1]) << 16) |
+                     (static_cast<uint32_t>(data[offset + 2]) << 8) |
+                     data[offset + 3];
+        offset += 4;
+        
+        // 5. RDLENGTH（2 字节，大端序）
+        answer.rdlength = (static_cast<uint16_t>(data[offset]) << 8) | data[offset + 1];
+        offset += 2;
+        
+        // 6. RDATA（rdlength 字节）
+        answer.rdata.assign(data + offset, data + offset + answer.rdlength);
+        offset += answer.rdlength;
+        
+        return answer;
+    }
+    
+    /**
      * 序列化 Answer 为字节数组
      */
     std::vector<uint8_t> serialize() const 
@@ -718,7 +758,258 @@ struct DNSMessage
     }
 };
 
-int main() 
+/**
+ * 向上游 DNS 服务器转发查询并获取响应
+ * 
+ * @param resolverAddr 上游 DNS 服务器地址
+ * @param question 要查询的问题
+ * @param queryId 查询 ID
+ * @return 从上游服务器获取的 Answer
+ * 
+ * ============================================================
+ * DNS 转发完整流程示例
+ * ============================================================
+ * 
+ * 场景：客户端查询 "abc.example.com" 和 "xyz.example.com"
+ *       转发服务器配置为 --resolver 8.8.8.8:53
+ * 
+ * ┌─────────────────────────────────────────────────────────────────────────────┐
+ * │                           整体数据流                                         │
+ * └─────────────────────────────────────────────────────────────────────────────┘
+ * 
+ *   ┌──────────┐         ┌──────────────────┐         ┌─────────────────┐
+ *   │  Client  │ ──(1)──>│  DNS Forwarder   │ ──(2)──>│  Upstream DNS   │
+ *   │ (Tester) │         │  (本程序:2053)    │         │  (8.8.8.8:53)   │
+ *   └──────────┘         └──────────────────┘         └─────────────────┘
+ *        │                       │                           │
+ *        │   请求: 2个问题        │                           │
+ *        │   ID=1234             │   转发请求1: abc.example.com
+ *        │                       │   ID=1234                 │
+ *        │                       │ ─────────────────────────>│
+ *        │                       │                           │
+ *        │                       │   响应1: 1.2.3.4          │
+ *        │                       │ <─────────────────────────│
+ *        │                       │                           │
+ *        │                       │   转发请求2: xyz.example.com
+ *        │                       │   ID=1234                 │
+ *        │                       │ ─────────────────────────>│
+ *        │                       │                           │
+ *        │                       │   响应2: 5.6.7.8          │
+ *        │                       │ <─────────────────────────│
+ *        │                       │                           │
+ *        │   合并响应: 2个答案    │                           │
+ *        │   ID=1234             │                           │
+ *        │ <─────────────────────│                           │
+ *        │                       │                           │
+ * 
+ * ┌─────────────────────────────────────────────────────────────────────────────┐
+ * │ 步骤 1: 客户端发送请求到转发服务器 (端口 2053)                                │
+ * └─────────────────────────────────────────────────────────────────────────────┘
+ * 
+ *   客户端请求（包含 2 个问题）：
+ *   
+ *   Header (12 bytes):
+ *   +--+--+--+--+--+--+--+--+--+--+--+--+
+ *   |         ID = 1234 (0x04D2)        |
+ *   +--+--+--+--+--+--+--+--+--+--+--+--+
+ *   |QR=0|OP=0|AA|TC|RD=1|RA|Z|RCODE=0  |  Flags = 0x0100
+ *   +--+--+--+--+--+--+--+--+--+--+--+--+
+ *   |         QDCOUNT = 2               |  2 个问题
+ *   +--+--+--+--+--+--+--+--+--+--+--+--+
+ *   |         ANCOUNT = 0               |
+ *   +--+--+--+--+--+--+--+--+--+--+--+--+
+ *   |         NSCOUNT = 0               |
+ *   +--+--+--+--+--+--+--+--+--+--+--+--+
+ *   |         ARCOUNT = 0               |
+ *   +--+--+--+--+--+--+--+--+--+--+--+--+
+ *   
+ *   Question 1: abc.example.com
+ *   +--+--+--+--+--+--+--+--+--+--+--+--+
+ *   | 3|a |b |c | 7|e |x |a |m |p |l |e |  \x03abc\x07example\x03com\x00
+ *   +--+--+--+--+--+--+--+--+--+--+--+--+
+ *   | 3|c |o |m | 0|           TYPE=1   |  TYPE = A
+ *   +--+--+--+--+--+--+--+--+--+--+--+--+
+ *   |         CLASS = 1 (IN)            |
+ *   +--+--+--+--+--+--+--+--+--+--+--+--+
+ *   
+ *   Question 2: xyz.example.com (使用压缩指针)
+ *   +--+--+--+--+--+--+--+--+--+--+--+--+
+ *   | 3|x |y |z |0xC0|0x10|  TYPE=1     |  \x03xyz + 指针(指向 offset 16)
+ *   +--+--+--+--+--+--+--+--+--+--+--+--+
+ *   |         CLASS = 1 (IN)            |
+ *   +--+--+--+--+--+--+--+--+--+--+--+--+
+ * 
+ * ┌─────────────────────────────────────────────────────────────────────────────┐
+ * │ 步骤 2: 转发服务器解析请求                                                   │
+ * └─────────────────────────────────────────────────────────────────────────────┘
+ * 
+ *   1. 解析 Header:
+ *      - ID = 1234
+ *      - QDCOUNT = 2 (有 2 个问题)
+ *      - RD = 1 (期望递归)
+ *   
+ *   2. 解析 Question 1:
+ *      - 读取 \x03abc -> "abc"
+ *      - 读取 \x07example -> "example"
+ *      - 读取 \x03com -> "com"
+ *      - 读取 \x00 -> 结束
+ *      - 结果: name = "abc.example.com"
+ *   
+ *   3. 解析 Question 2 (带压缩):
+ *      - 读取 \x03xyz -> "xyz"
+ *      - 读取 0xC0 0x10 -> 压缩指针，偏移 = 16
+ *      - 跳转到 offset 16，继续读取 "example.com"
+ *      - 结果: name = "xyz.example.com"
+ * 
+ * ┌─────────────────────────────────────────────────────────────────────────────┐
+ * │ 步骤 3: 分别转发每个问题到上游 DNS (因为上游只接受单个问题)                    │
+ * └─────────────────────────────────────────────────────────────────────────────┘
+ * 
+ *   转发请求 1 (abc.example.com):
+ *   +--+--+--+--+--+--+--+--+--+--+--+--+
+ *   |         ID = 1234                 |  保持原 ID
+ *   +--+--+--+--+--+--+--+--+--+--+--+--+
+ *   |         Flags = 0x0100 (RD=1)     |
+ *   +--+--+--+--+--+--+--+--+--+--+--+--+
+ *   |         QDCOUNT = 1               |  只有 1 个问题！
+ *   +--+--+--+--+--+--+--+--+--+--+--+--+
+ *   |    Question: abc.example.com      |
+ *   +--+--+--+--+--+--+--+--+--+--+--+--+
+ *   
+ *   上游响应 1:
+ *   +--+--+--+--+--+--+--+--+--+--+--+--+
+ *   |         ID = 1234                 |
+ *   +--+--+--+--+--+--+--+--+--+--+--+--+
+ *   |         ANCOUNT = 1               |
+ *   +--+--+--+--+--+--+--+--+--+--+--+--+
+ *   |    Answer: abc.example.com        |
+ *   |    TYPE=A, CLASS=IN, TTL=300      |
+ *   |    RDATA = 1.2.3.4                |
+ *   +--+--+--+--+--+--+--+--+--+--+--+--+
+ *   
+ *   转发请求 2 (xyz.example.com): 同样流程...
+ *   上游响应 2: RDATA = 5.6.7.8
+ * 
+ * ┌─────────────────────────────────────────────────────────────────────────────┐
+ * │ 步骤 4: 合并响应并返回给客户端                                               │
+ * └─────────────────────────────────────────────────────────────────────────────┘
+ * 
+ *   最终响应（合并 2 个答案）：
+ *   
+ *   Header:
+ *   +--+--+--+--+--+--+--+--+--+--+--+--+
+ *   |         ID = 1234                 |  必须与原请求 ID 匹配！
+ *   +--+--+--+--+--+--+--+--+--+--+--+--+
+ *   |QR=1|OP=0|AA|TC|RD=1|RA|Z|RCODE=0  |  QR=1 表示响应
+ *   +--+--+--+--+--+--+--+--+--+--+--+--+
+ *   |         QDCOUNT = 2               |  2 个问题
+ *   +--+--+--+--+--+--+--+--+--+--+--+--+
+ *   |         ANCOUNT = 2               |  2 个答案
+ *   +--+--+--+--+--+--+--+--+--+--+--+--+
+ *   
+ *   Question Section (不压缩):
+ *   +--+--+--+--+--+--+--+--+--+--+--+--+
+ *   |    Question 1: abc.example.com    |
+ *   +--+--+--+--+--+--+--+--+--+--+--+--+
+ *   |    Question 2: xyz.example.com    |
+ *   +--+--+--+--+--+--+--+--+--+--+--+--+
+ *   
+ *   Answer Section (不压缩):
+ *   +--+--+--+--+--+--+--+--+--+--+--+--+
+ *   |    Answer 1: abc.example.com      |
+ *   |    TYPE=A, CLASS=IN, TTL=300      |
+ *   |    RDLENGTH=4, RDATA=1.2.3.4      |
+ *   +--+--+--+--+--+--+--+--+--+--+--+--+
+ *   |    Answer 2: xyz.example.com      |
+ *   |    TYPE=A, CLASS=IN, TTL=300      |
+ *   |    RDLENGTH=4, RDATA=5.6.7.8      |
+ *   +--+--+--+--+--+--+--+--+--+--+--+--+
+ * 
+ * ============================================================
+ * 关键点总结
+ * ============================================================
+ * 
+ * 1. 上游 DNS 只接受单个问题
+ *    - 收到多个问题时，必须拆分成多个请求分别转发
+ *    - 然后将所有响应合并成一个包返回
+ * 
+ * 2. ID 必须匹配
+ *    - 返回给客户端的响应 ID 必须与原始请求相同
+ *    - 转发给上游的请求可以使用相同 ID（简化实现）
+ * 
+ * 3. 压缩指针只在解析时处理
+ *    - 解析请求时支持压缩指针
+ *    - 生成响应时不使用压缩（简化实现）
+ */
+DNSAnswer forwardQuery(const sockaddr_in& resolverAddr, const DNSQuestion& question, uint16_t queryId)
+{
+    // 创建转发用的 socket
+    int forwardSocket = socket(AF_INET, SOCK_DGRAM, 0);
+    if (forwardSocket == -1)
+    {
+        perror("Failed to create forward socket");
+        return DNSAnswer{};
+    }
+    
+    // 构建转发请求（只包含 1 个问题）
+    DNSMessage forwardRequest;
+    forwardRequest.header.id = queryId;
+    forwardRequest.header.flags = 0x0100;  // RD=1 (期望递归)
+    forwardRequest.header.qdcount = 1;     // 关键：只有 1 个问题
+    forwardRequest.header.ancount = 0;
+    forwardRequest.header.nscount = 0;
+    forwardRequest.header.arcount = 0;
+    forwardRequest.questions.push_back(question);
+    
+    std::vector<uint8_t> requestBytes = forwardRequest.serialize();
+    
+    // 发送请求到上游 DNS 服务器
+    if (sendto(forwardSocket, requestBytes.data(), requestBytes.size(), 0,
+               reinterpret_cast<const struct sockaddr*>(&resolverAddr), sizeof(resolverAddr)) == -1)
+    {
+        perror("Failed to send to resolver");
+        close(forwardSocket);
+        return DNSAnswer{};
+    }
+    
+    // 接收响应
+    // recvfrom() 默认是阻塞调用
+    char responseBuffer[512];
+    socklen_t addrLen = sizeof(resolverAddr);
+    int bytesReceived = recvfrom(forwardSocket, responseBuffer, sizeof(responseBuffer), 0,
+                                  nullptr, nullptr);
+    close(forwardSocket);
+    
+    if (bytesReceived == -1)
+    {
+        perror("Failed to receive from resolver");
+        return DNSAnswer{};
+    }
+    
+    // 解析响应
+    const uint8_t* responseData = reinterpret_cast<uint8_t*>(responseBuffer);
+    DNSHeader responseHeader = DNSHeader::parse(responseData);
+    
+    // 跳过 Header 和 Question 部分，解析 Answer
+    size_t offset = 12;  // Header 大小
+    
+    // 跳过 Question 部分
+    for (uint16_t i = 0; i < responseHeader.qdcount; i++)
+    {
+        DNSQuestion::parse(responseData, offset);
+    }
+    
+    // 解析 Answer 部分
+    DNSAnswer answer;
+    if (responseHeader.ancount > 0)
+    {
+        answer = DNSAnswer::parse(responseData, offset);
+    }
+    
+    return answer;
+}
+
+int main(int argc, char* argv[])
 {
     // ==================== 1. 初始化输出设置 ====================
     // 设置 std::cout 和 std::cerr 为无缓冲模式
@@ -733,6 +1024,36 @@ int main()
 
     // 调试信息，用于确认程序已启动
     std::cout << "Logs from your program will appear here!" << std::endl;
+    
+    // ==================== 1.5 解析命令行参数 ====================
+    // 格式: ./your_server --resolver <ip>:<port>
+    std::string resolverIp;
+    int resolverPort = 0;
+    
+    for (int i = 1; i < argc; i++)
+    {
+        if (std::string(argv[i]) == "--resolver" && i + 1 < argc)
+        {
+            std::string resolverAddr = argv[i + 1];
+            size_t colonPos = resolverAddr.find(':');
+            if (colonPos != std::string::npos)
+            {
+                resolverIp = resolverAddr.substr(0, colonPos);
+                resolverPort = std::stoi(resolverAddr.substr(colonPos + 1));
+            }
+            break;
+        }
+    }
+    
+    // 配置上游 DNS 服务器地址
+    sockaddr_in resolverAddress{};
+    if (!resolverIp.empty())
+    {
+        resolverAddress.sin_family = AF_INET;
+        resolverAddress.sin_port = htons(resolverPort);
+        inet_pton(AF_INET, resolverIp.c_str(), &resolverAddress.sin_addr);
+        std::cout << "Using resolver: " << resolverIp << ":" << resolverPort << std::endl;
+    }
 
     // ==================== 2. 创建 UDP Socket ====================
     // socket() 函数创建一个通信端点，返回文件描述符
@@ -877,15 +1198,26 @@ int main()
             question.qclass = 1;     // CLASS = 1 (IN，互联网)
             response.questions.push_back(question);
             
-            // 添加 Answer（使用解析到的域名，不压缩）
-            DNSAnswer answer;
-            answer.name = reqQuestion.name;
-            answer.type = 1;         // TYPE = 1 (A 记录)
-            answer.aclass = 1;       // CLASS = 1 (IN，互联网)
-            answer.ttl = 60;         // TTL = 60 秒
-            answer.rdlength = 4;     // RDATA 长度 = 4 字节（IPv4 地址）
-            answer.rdata = {8, 8, 8, 8};  // IP 地址 8.8.8.8
-            response.answers.push_back(answer);
+            // 如果配置了 resolver，转发查询；否则返回固定 IP
+            if (!resolverIp.empty())
+            {
+                // 转发查询到上游 DNS 服务器
+                // 注意：上游服务器只接受单个问题，所以每个问题单独转发
+                DNSAnswer answer = forwardQuery(resolverAddress, reqQuestion, requestHeader.id);
+                response.answers.push_back(answer);
+            }
+            else
+            {
+                // 没有配置 resolver，返回固定 IP（兼容之前的阶段）
+                DNSAnswer answer;
+                answer.name = reqQuestion.name;
+                answer.type = 1;         // TYPE = 1 (A 记录)
+                answer.aclass = 1;       // CLASS = 1 (IN，互联网)
+                answer.ttl = 60;         // TTL = 60 秒
+                answer.rdlength = 4;     // RDATA 长度 = 4 字节（IPv4 地址）
+                answer.rdata = {8, 8, 8, 8};  // IP 地址 8.8.8.8
+                response.answers.push_back(answer);
+            }
         }
         
         // ===== 序列化响应 =====
