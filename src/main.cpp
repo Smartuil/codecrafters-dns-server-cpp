@@ -50,6 +50,160 @@ struct DNSHeader
     uint16_t arcount;   // Additional Count: 附加部分的记录数
     
     /**
+     * 从字节数组解析 DNS Header（反序列化）
+     * 
+     * @param data 原始字节数据（至少 12 字节）
+     * @return 解析后的 DNSHeader
+     * 
+     * ============================================================
+     * 完整解析示例：假设收到以下 12 字节的 DNS 请求头
+     * ============================================================
+     * 
+     * 原始字节（十六进制）：
+     *   索引:  [0]   [1]   [2]   [3]   [4]   [5]   [6]   [7]   [8]   [9]  [10]  [11]
+     *   数据:  0x04  0xD2  0x01  0x00  0x00  0x01  0x00  0x00  0x00  0x00  0x00  0x00
+     *          |--ID---|  |-flags-|  |qdcount|  |ancount|  |nscount|  |arcount|
+     * 
+     * ---------- 1. 解析 ID（字节 0-1）----------
+     * 
+     *   data[0] = 0x04 = 0000 0100
+     *   data[1] = 0xD2 = 1101 0010
+     * 
+     *   计算过程：(data[0] << 8) | data[1]
+     *   
+     *   步骤 1: data[0] << 8
+     *           0x04 << 8 = 0x0400
+     *           二进制: 0000 0100 0000 0000
+     *   
+     *   步骤 2: | data[1]
+     *           0x0400 | 0xD2 = 0x04D2
+     *           二进制: 0000 0100 0000 0000
+     *                 | 0000 0000 1101 0010
+     *                 = 0000 0100 1101 0010
+     *   
+     *   结果: id = 0x04D2 = 1234
+     * 
+     * ---------- 2. 解析 Flags（字节 2-3）----------
+     * 
+     *   data[2] = 0x01 = 0000 0001
+     *   data[3] = 0x00 = 0000 0000
+     * 
+     *   计算过程：(data[2] << 8) | data[3]
+     *   
+     *   步骤 1: data[2] << 8
+     *           0x01 << 8 = 0x0100
+     *   
+     *   步骤 2: | data[3]
+     *           0x0100 | 0x00 = 0x0100
+     *   
+     *   结果: flags = 0x0100 = 0000 0001 0000 0000
+     *   
+     *   Flags 位布局（从高位到低位）：
+     *   |QR|  OPCODE |AA|TC|RD|RA|  Z  | RCODE |
+     *   |15| 14-11   |10| 9| 8| 7| 6-4 |  3-0  |
+     *   | 0| 0 0 0 0 | 0| 0| 1| 0| 0 0 0| 0 0 0 0|
+     *   
+     *   解析各字段：
+     *     - QR     = (0x0100 >> 15) & 0x01 = 0  （这是查询）
+     *     - OPCODE = (0x0100 >> 11) & 0x0F = 0  （标准查询）
+     *     - AA     = (0x0100 >> 10) & 0x01 = 0  （非权威）
+     *     - TC     = (0x0100 >> 9)  & 0x01 = 0  （未截断）
+     *     - RD     = (0x0100 >> 8)  & 0x01 = 1  （期望递归）
+     *     - RA     = (0x0100 >> 7)  & 0x01 = 0  （不支持递归）
+     *     - Z      = (0x0100 >> 4)  & 0x07 = 0  （保留）
+     *     - RCODE  = 0x0100 & 0x0F = 0          （无错误）
+     * 
+     * ---------- 3. 解析 QDCOUNT（字节 4-5）----------
+     * 
+     *   data[4] = 0x00, data[5] = 0x01
+     *   qdcount = (0x00 << 8) | 0x01 = 0x0001 = 1
+     *   含义：有 1 个问题
+     * 
+     * ---------- 4. 解析 ANCOUNT（字节 6-7）----------
+     * 
+     *   data[6] = 0x00, data[7] = 0x00
+     *   ancount = (0x00 << 8) | 0x00 = 0x0000 = 0
+     *   含义：有 0 个回答（查询请求通常为 0）
+     * 
+     * ---------- 5. 解析 NSCOUNT（字节 8-9）----------
+     * 
+     *   data[8] = 0x00, data[9] = 0x00
+     *   nscount = 0
+     * 
+     * ---------- 6. 解析 ARCOUNT（字节 10-11）----------
+     * 
+     *   data[10] = 0x00, data[11] = 0x00
+     *   arcount = 0
+     * 
+     * ============================================================
+     * 最终解析结果
+     * ============================================================
+     *   id      = 1234   (0x04D2)
+     *   flags   = 256    (0x0100) -> QR=0, OPCODE=0, RD=1
+     *   qdcount = 1      (1 个问题)
+     *   ancount = 0      (0 个回答)
+     *   nscount = 0
+     *   arcount = 0
+     */
+    static DNSHeader parse(const uint8_t* data)
+    {
+        DNSHeader header;
+        
+        // ID（2 字节，大端序）: 高字节在前，低字节在后
+        // 示例: [0x04, 0xD2] -> (0x04 << 8) | 0xD2 = 0x04D2 = 1234
+        header.id = (static_cast<uint16_t>(data[0]) << 8) | data[1];
+        
+        // Flags（2 字节，大端序）
+        // 示例: [0x01, 0x00] -> (0x01 << 8) | 0x00 = 0x0100
+        header.flags = (static_cast<uint16_t>(data[2]) << 8) | data[3];
+        
+        // QDCOUNT（2 字节）
+        // 示例: [0x00, 0x01] -> 1
+        header.qdcount = (static_cast<uint16_t>(data[4]) << 8) | data[5];
+        
+        // ANCOUNT（2 字节）
+        header.ancount = (static_cast<uint16_t>(data[6]) << 8) | data[7];
+        
+        // NSCOUNT（2 字节）
+        header.nscount = (static_cast<uint16_t>(data[8]) << 8) | data[9];
+        
+        // ARCOUNT（2 字节）
+        header.arcount = (static_cast<uint16_t>(data[10]) << 8) | data[11];
+        
+        return header;
+    }
+    
+    /**
+     * 从 flags 中提取 OPCODE（4 bits，位 14-11）
+     * 
+     * Flags 位布局: |QR(15)|OPCODE(14-11)|AA(10)|TC(9)|RD(8)|RA(7)|Z(6-4)|RCODE(3-0)|
+     * 
+     * 提取示例（flags = 0x0100 = 0000 0001 0000 0000）：
+     *   步骤 1: flags >> 11
+     *           0000 0001 0000 0000 >> 11 = 0000 0000 0000 0000 = 0
+     *   步骤 2: & 0x0F (保留低 4 位)
+     *           0 & 0x0F = 0
+     *   结果: OPCODE = 0 (标准查询)
+     * 
+     * 另一示例（flags = 0x7800，OPCODE=15）：
+     *   0111 1000 0000 0000 >> 11 = 0000 0000 0000 1111 = 15
+     *   15 & 0x0F = 15
+     */
+    uint8_t getOpcode() const { return (flags >> 11) & 0x0F; }
+    
+    /**
+     * 从 flags 中提取 RD（1 bit，位 8）
+     * 
+     * 提取示例（flags = 0x0100 = 0000 0001 0000 0000）：
+     *   步骤 1: flags >> 8
+     *           0000 0001 0000 0000 >> 8 = 0000 0000 0000 0001 = 1
+     *   步骤 2: & 0x01 (保留最低 1 位)
+     *           1 & 0x01 = 1
+     *   结果: RD = 1 (期望递归查询)
+     */
+    uint8_t getRD() const { return (flags >> 8) & 0x01; }
+    
+    /**
      * 将 DNS Header 序列化为字节数组（网络字节序，大端）
      * 
      * 大端序 vs 小端序示例（以 id = 1234 = 0x04D2 为例）：
@@ -457,25 +611,32 @@ int main()
         buffer[bytesRead] = '\0';
         std::cout << "Received " << bytesRead << " bytes" << std::endl;
 
-        // ---------- 5.2 构建 DNS 响应 ----------
+        // ---------- 5.2 解析请求并构建 DNS 响应 ----------
+        // 首先解析请求的 Header
+        DNSHeader requestHeader = DNSHeader::parse(reinterpret_cast<uint8_t*>(buffer));
+        
         // 使用 DNSMessage 统一管理响应
         DNSMessage response;
         
         // ===== 设置 Header =====
-        response.header.id = 1234;      // 包标识符（测试期望值：1234）
+        // 从请求中复制 ID（必须匹配）
+        response.header.id = requestHeader.id;
+        
+        // 从请求中提取需要复制的字段
+        uint8_t requestOpcode = requestHeader.getOpcode();
+        uint8_t requestRD = requestHeader.getRD();
         
         // 构建 flags 字段（16 bits）：
         // QR(1) | OPCODE(4) | AA(1) | TC(1) | RD(1) | RA(1) | Z(3) | RCODE(4)
-        //   1   |   0000    |   0   |   0   |   0   |   0   | 000  |  0000
-        // = 1000 0000 0000 0000 = 0x8000
-        uint16_t qr = 1;        // QR = 1 表示这是响应包
-        uint16_t opcode = 0;    // OPCODE = 0 标准查询
-        uint16_t aa = 0;        // AA = 0 非权威回答
-        uint16_t tc = 0;        // TC = 0 未截断
-        uint16_t rd = 0;        // RD = 0 不需要递归
-        uint16_t ra = 0;        // RA = 0 不支持递归
-        uint16_t z = 0;         // Z = 0 保留字段
-        uint16_t rcode = 0;     // RCODE = 0 无错误
+        uint16_t qr = 1;                    // QR = 1 表示这是响应包
+        uint16_t opcode = requestOpcode;    // OPCODE: 从请求复制
+        uint16_t aa = 0;                    // AA = 0 非权威回答
+        uint16_t tc = 0;                    // TC = 0 未截断
+        uint16_t rd = requestRD;            // RD: 从请求复制
+        uint16_t ra = 0;                    // RA = 0 不支持递归
+        uint16_t z = 0;                     // Z = 0 保留字段
+        // RCODE: 如果 OPCODE=0 则返回 0（无错误），否则返回 4（未实现）
+        uint16_t rcode = (requestOpcode == 0) ? 0 : 4;
         
         // 按位组合 flags
         // |QR(1)|OPCODE(4)|AA(1)|TC(1)|RD(1)|RA(1)|Z(3)|RCODE(4)|
