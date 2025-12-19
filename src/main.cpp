@@ -295,88 +295,70 @@ struct DNSQuestion
     uint16_t qclass;     // 记录类别（1 = IN，互联网）
     
     /**
-     * 从字节数组解析 DNS Question（反序列化）
+     * 从字节数组解析 DNS Question（反序列化）- 支持压缩
      * 
-     * @param data 原始字节数据（从 Question 部分开始，即 Header 之后的第 12 字节）
+     * @param data 原始字节数据（完整的 DNS 消息，从头开始）
      * @param offset [输入/输出] 当前解析位置，解析完成后更新为下一个位置
      * @return 解析后的 DNSQuestion
      * 
      * ============================================================
-     * 完整解析示例：假设收到以下 Question 数据
+     * DNS 消息压缩机制（RFC 1035 Section 4.1.4）
      * ============================================================
      * 
-     * 原始字节（从 offset=12 开始，即 Header 之后）：
-     *   索引: [12]  [13] [14] [15] [16] [17] [18] [19] [20] [21] [22] [23] [24] [25] [26] [27] [28] [29] [30] [31] [32] [33]
-     *   数据: 0x0C  'c'  'o'  'd'  'e'  'c'  'r'  'a'  'f'  't'  'e'  'r'  's'  0x02 'i'  'o'  0x00 0x00 0x01 0x00 0x01
-     *         |--- 长度=12 ---|----------- "codecrafters" ------------|--- 长度=2 ---|-- "io" --|结束|-- TYPE --|-- CLASS -|
-     * 
-     * ---------- 1. 解析域名（标签序列）----------
-     * 
-     *   步骤 1: 读取 data[12] = 0x0C = 12（第一个标签长度）
-     *           读取接下来 12 个字节: "codecrafters"
-     *           name = "codecrafters"
+     * 压缩原理：
+     *   为了减少消息大小，DNS 允许使用"指针"来引用之前出现过的域名。
+     *   指针是一个 2 字节的值，格式如下：
      *   
-     *   步骤 2: 读取 data[25] = 0x02 = 2（第二个标签长度）
-     *           读取接下来 2 个字节: "io"
-     *           name = "codecrafters.io"
+     *   +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+     *   | 1  1|                OFFSET                   |
+     *   +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
      *   
-     *   步骤 3: 读取 data[28] = 0x00（结束符）
-     *           域名解析完成
-     *           offset 更新为 29
+     *   - 高 2 位为 11（0xC0）表示这是一个指针
+     *   - 低 14 位是从消息开头的偏移量
      * 
-     * ---------- 2. 解析 TYPE（2 字节）----------
-     * 
-     *   data[29] = 0x00, data[30] = 0x01
-     *   type = (0x00 << 8) | 0x01 = 1 (A 记录)
-     *   offset 更新为 31
-     * 
-     * ---------- 3. 解析 CLASS（2 字节）----------
-     * 
-     *   data[31] = 0x00, data[32] = 0x01
-     *   qclass = (0x00 << 8) | 0x01 = 1 (IN 互联网)
-     *   offset 更新为 33
+     * 判断方法：
+     *   - 普通标签: 长度字节 < 64 (0x00-0x3F)，高 2 位为 00
+     *   - 压缩指针: 长度字节 >= 192 (0xC0-0xFF)，高 2 位为 11
      * 
      * ============================================================
-     * 最终解析结果
+     * 压缩示例
      * ============================================================
-     *   name   = "codecrafters.io"
-     *   type   = 1 (A 记录)
-     *   qclass = 1 (IN)
-     *   offset = 33 (指向下一个 Question 或 Answer 的起始位置)
+     * 
+     * 假设消息中有两个问题：
+     *   Question 1: "codecrafters.io"
+     *   Question 2: "abc.codecrafters.io"（压缩）
+     * 
+     * 原始字节布局：
+     *   [0-11]  Header (12 bytes)
+     *   [12]    0x0C (长度=12)
+     *   [13-24] "codecrafters"
+     *   [25]    0x02 (长度=2)
+     *   [26-27] "io"
+     *   [28]    0x00 (结束)
+     *   [29-30] TYPE (0x0001)
+     *   [31-32] CLASS (0x0001)
+     *   
+     *   Question 2 (使用压缩):
+     *   [33]    0x03 (长度=3)
+     *   [34-36] "abc"
+     *   [37-38] 0xC0 0x0C (指针，指向偏移 12，即 "codecrafters.io")
+     *   [39-40] TYPE (0x0001)
+     *   [41-42] CLASS (0x0001)
+     * 
+     * 解析 Question 2:
+     *   1. 读取 [33] = 0x03，这是普通标签，长度=3
+     *   2. 读取 "abc"
+     *   3. 读取 [37] = 0xC0，高 2 位为 11，这是压缩指针
+     *   4. 计算偏移: (0xC0 & 0x3F) << 8 | 0x0C = 0x000C = 12
+     *   5. 跳转到偏移 12，继续解析 "codecrafters.io"
+     *   6. 最终得到: "abc.codecrafters.io"
      */
     static DNSQuestion parse(const uint8_t* data, size_t& offset)
     {
         DNSQuestion question;
         
-        // ========== 解析域名（标签序列）==========
-        // 域名格式: <长度><标签内容><长度><标签内容>...<0x00>
-        std::string name;
-        while (true)
-        {
-            // 读取标签长度
-            uint8_t labelLen = data[offset];
-            offset++;
-            
-            // 长度为 0 表示域名结束
-            if (labelLen == 0)
-            {
-                break;
-            }
-            
-            // 如果不是第一个标签，添加分隔符 '.'
-            if (!name.empty())
-            {
-                name += '.';
-            }
-            
-            // 读取标签内容
-            for (uint8_t i = 0; i < labelLen; i++)
-            {
-                name += static_cast<char>(data[offset]);
-                offset++;
-            }
-        }
-        question.name = name;
+        // 解析域名（支持压缩）
+        question.name = parseDomainName(data, offset);
         
         // ========== 解析 TYPE（2 字节，大端序）==========
         question.type = (static_cast<uint16_t>(data[offset]) << 8) | data[offset + 1];
@@ -387,6 +369,136 @@ struct DNSQuestion
         offset += 2;
         
         return question;
+    }
+    
+    /**
+     * 解析域名（支持压缩指针）
+     * 
+     * @param data 完整的 DNS 消息数据
+     * @param offset [输入/输出] 当前位置，解析后更新（注意：遇到指针时只前进 2 字节）
+     * @return 解析后的域名字符串
+     * 
+     * ============================================================
+     * 压缩指针偏移量计算详解
+     * ============================================================
+     * 
+     * 压缩指针格式（2 字节）：
+     *   字节1: [1 1 X X X X X X]  字节2: [Y Y Y Y Y Y Y Y]
+     *          ↑ ↑ └────┬────┘          └──────┬──────┘
+     *        标志位   高6位               低8位
+     *                 └──────────┬──────────┘
+     *                       14位偏移量
+     * 
+     * 公式: offset = ((byte1 & 0x3F) << 8) | byte2
+     * 
+     * ---------- 示例 1: 指针 0xC0 0x0C（偏移 12）----------
+     * 
+     *   字节1: 0xC0 = 1100 0000
+     *   字节2: 0x0C = 0000 1100
+     * 
+     *   步骤 1: 0xC0 & 0x3F（去掉标志位，保留低6位）
+     *           1100 0000
+     *         & 0011 1111
+     *         ───────────
+     *           0000 0000 = 0x00
+     * 
+     *   步骤 2: 0x00 << 8（左移8位，为低8位腾出空间）
+     *           0x00 << 8 = 0x0000
+     * 
+     *   步骤 3: 0x0000 | 0x0C（合并低8位）
+     *           0000 0000 0000 0000
+     *         | 0000 0000 0000 1100
+     *         ─────────────────────
+     *           0000 0000 0000 1100 = 0x000C = 12
+     * 
+     *   结果: 偏移量 = 12
+     * 
+     * ---------- 示例 2: 指针 0xC1 0x2F（偏移 303）----------
+     * 
+     *   字节1: 0xC1 = 1100 0001
+     *   字节2: 0x2F = 0010 1111
+     * 
+     *   步骤 1: 0xC1 & 0x3F = 0000 0001 = 0x01
+     *   步骤 2: 0x01 << 8   = 0x0100 = 256
+     *   步骤 3: 0x0100 | 0x2F = 0x012F = 303
+     * 
+     *   结果: 偏移量 = 303
+     * 
+     * 注意: 14位偏移量最大可表示 2^14 - 1 = 16383 字节
+     */
+    static std::string parseDomainName(const uint8_t* data, size_t& offset)
+    {
+        std::string name;
+        bool jumped = false;      // 是否已经跳转过（用于正确更新 offset）
+        size_t jumpOffset = 0;    // 跳转前的位置
+        size_t currentPos = offset;
+        
+        while (true)
+        {
+            uint8_t labelLen = data[currentPos];
+            
+            // 检查是否是压缩指针（高 2 位为 11，即 >= 0xC0）
+            // 判断方法: labelLen & 0xC0 == 0xC0
+            //   0xC0 = 1100 0000，与操作后如果高2位是11，结果仍为0xC0
+            if ((labelLen & 0xC0) == 0xC0)
+            {
+                // 这是一个压缩指针
+                // 指针格式: [11XXXXXX] [YYYYYYYY] (2 bytes)
+                //           ^^标志位   低14位是偏移量
+                if (!jumped)
+                {
+                    // 第一次跳转，记录原始位置 + 2（指针占 2 字节）
+                    jumpOffset = currentPos + 2;
+                    jumped = true;
+                }
+                
+                // 计算指针指向的偏移量
+                // ((labelLen & 0x3F) << 8) | data[currentPos + 1]
+                //   1. labelLen & 0x3F: 清除高2位标志位，保留低6位
+                //   2. << 8: 左移8位，为低8位腾出空间
+                //   3. | data[currentPos + 1]: 合并第二个字节（低8位）
+                uint16_t pointer = ((labelLen & 0x3F) << 8) | data[currentPos + 1];
+                currentPos = pointer;  // 跳转到指针指向的位置
+                continue;
+            }
+            
+            // 长度为 0 表示域名结束
+            if (labelLen == 0)
+            {
+                currentPos++;  // 跳过结束符
+                break;
+            }
+            
+            // 普通标签
+            currentPos++;  // 跳过长度字节
+            
+            // 如果不是第一个标签，添加分隔符 '.'
+            if (!name.empty())
+            {
+                name += '.';
+            }
+            
+            // 读取标签内容
+            for (uint8_t i = 0; i < labelLen; i++)
+            {
+                name += static_cast<char>(data[currentPos]);
+                currentPos++;
+            }
+        }
+        
+        // 更新 offset
+        // 如果发生了跳转，offset 应该指向指针之后（指针占 2 字节）
+        // 如果没有跳转，offset 应该指向域名结束符之后
+        if (jumped)
+        {
+            offset = jumpOffset;
+        }
+        else
+        {
+            offset = currentPos;
+        }
+        
+        return name;
     }
     
     /**
@@ -711,11 +823,15 @@ int main()
         const uint8_t* requestData = reinterpret_cast<uint8_t*>(buffer);
         DNSHeader requestHeader = DNSHeader::parse(requestData);
         
-        // 解析 Question 部分（从 offset=12 开始，即 Header 之后）
+        // 解析所有 Question（从 offset=12 开始，即 Header 之后）
         size_t offset = 12;  // DNS Header 固定 12 字节
-        DNSQuestion requestQuestion = DNSQuestion::parse(requestData, offset);
-        
-        std::cout << "Query for domain: " << requestQuestion.name << std::endl;
+        std::vector<DNSQuestion> requestQuestions;
+        for (uint16_t i = 0; i < requestHeader.qdcount; i++)
+        {
+            DNSQuestion q = DNSQuestion::parse(requestData, offset);
+            std::cout << "Query " << (i + 1) << " for domain: " << q.name << std::endl;
+            requestQuestions.push_back(q);
+        }
         
         // 使用 DNSMessage 统一管理响应
         DNSMessage response;
@@ -746,29 +862,31 @@ int main()
                                 (tc << 9) | (rd << 8) | (ra << 7) | 
                                 (z << 4) | rcode;
         
-        response.header.qdcount = 1;    // 问题数：1
-        response.header.ancount = 1;    // 回答数：1（本阶段需要返回 answer）
+        response.header.qdcount = requestQuestions.size();  // 问题数：与请求相同
+        response.header.ancount = requestQuestions.size();  // 回答数：每个问题一个回答
         response.header.nscount = 0;    // 授权记录数：0
         response.header.arcount = 0;    // 附加记录数：0
         
-        // ===== 添加 Question（从请求中复制）=====
-        DNSQuestion question;
-        question.name = requestQuestion.name;    // 使用解析到的域名
-        question.type = 1;                       // TYPE = 1 (A 记录)
-        question.qclass = 1;                     // CLASS = 1 (IN，互联网)
-        response.questions.push_back(question);
-        
-        // ===== 添加 Answer（使用解析到的域名）=====
-        DNSAnswer answer;
-        answer.name = requestQuestion.name;      // 域名（与 Question 相同）
-        answer.type = 1;                         // TYPE = 1 (A 记录)
-        answer.aclass = 1;                       // CLASS = 1 (IN，互联网)
-        answer.ttl = 60;                         // TTL = 60 秒
-        answer.rdlength = 4;                     // RDATA 长度 = 4 字节（IPv4 地址）
-        // RDATA: IP 地址 8.8.8.8
-        // 每个数字占 1 字节: [8, 8, 8, 8] = [0x08, 0x08, 0x08, 0x08]
-        answer.rdata = {8, 8, 8, 8};
-        response.answers.push_back(answer);
+        // ===== 为每个 Question 添加 Question 和 Answer =====
+        for (const auto& reqQuestion : requestQuestions)
+        {
+            // 添加 Question（从请求中复制，不压缩）
+            DNSQuestion question;
+            question.name = reqQuestion.name;
+            question.type = 1;       // TYPE = 1 (A 记录)
+            question.qclass = 1;     // CLASS = 1 (IN，互联网)
+            response.questions.push_back(question);
+            
+            // 添加 Answer（使用解析到的域名，不压缩）
+            DNSAnswer answer;
+            answer.name = reqQuestion.name;
+            answer.type = 1;         // TYPE = 1 (A 记录)
+            answer.aclass = 1;       // CLASS = 1 (IN，互联网)
+            answer.ttl = 60;         // TTL = 60 秒
+            answer.rdlength = 4;     // RDATA 长度 = 4 字节（IPv4 地址）
+            answer.rdata = {8, 8, 8, 8};  // IP 地址 8.8.8.8
+            response.answers.push_back(answer);
+        }
         
         // ===== 序列化响应 =====
         std::vector<uint8_t> responseBytes = response.serialize();
