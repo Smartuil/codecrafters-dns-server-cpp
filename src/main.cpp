@@ -249,6 +249,81 @@ struct DNSQuestion
 };
 
 /**
+ * DNS Answer (Resource Record) 结构体
+ * 
+ * Answer Section 格式（RFC 1035 Section 3.2.1）：
+ * +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+ * |                     NAME                      |  变长，域名编码
+ * +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+ * |                     TYPE                      |  16 bits，记录类型
+ * +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+ * |                     CLASS                     |  16 bits，记录类别
+ * +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+ * |                     TTL                       |  32 bits，生存时间
+ * +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+ * |                   RDLENGTH                    |  16 bits，RDATA 长度
+ * +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+ * |                    RDATA                      |  变长，记录数据
+ * +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+
+ * 
+ * A 记录示例（codecrafters.io -> 8.8.8.8）：
+ *   NAME:     \x0ccodecrafters\x02io\x00  (域名编码)
+ *   TYPE:     0x0001                       (A 记录)
+ *   CLASS:    0x0001                       (IN 互联网)
+ *   TTL:      0x0000003C                   (60 秒)
+ *   RDLENGTH: 0x0004                       (4 字节)
+ *   RDATA:    0x08080808                   (8.8.8.8)
+ */
+struct DNSAnswer 
+{
+    std::string name;       // 域名
+    uint16_t type;          // 记录类型（1 = A 记录）
+    uint16_t aclass;        // 记录类别（1 = IN）
+    uint32_t ttl;           // 生存时间（秒）
+    uint16_t rdlength;      // RDATA 长度
+    std::vector<uint8_t> rdata;  // 记录数据（A 记录为 4 字节 IP 地址）
+    
+    /**
+     * 序列化 Answer 为字节数组
+     */
+    std::vector<uint8_t> serialize() const 
+    {
+        std::vector<uint8_t> bytes;
+        
+        // 1. NAME - 域名编码（复用 DNSQuestion 的编码函数）
+        std::vector<uint8_t> encodedName = DNSQuestion::encodeDomainName(name);
+        bytes.insert(bytes.end(), encodedName.begin(), encodedName.end());
+        
+        // 2. TYPE（2 字节，大端序）
+        bytes.push_back((type >> 8) & 0xFF);
+        bytes.push_back(type & 0xFF);
+        
+        // 3. CLASS（2 字节，大端序）
+        bytes.push_back((aclass >> 8) & 0xFF);
+        bytes.push_back(aclass & 0xFF);
+        
+        // 4. TTL（4 字节，大端序）
+        // 示例: ttl = 60 = 0x0000003C
+        //   bytes = [0x00, 0x00, 0x00, 0x3C]
+        bytes.push_back((ttl >> 24) & 0xFF);  // 最高字节
+        bytes.push_back((ttl >> 16) & 0xFF);
+        bytes.push_back((ttl >> 8) & 0xFF);
+        bytes.push_back(ttl & 0xFF);          // 最低字节
+        
+        // 5. RDLENGTH（2 字节，大端序）
+        bytes.push_back((rdlength >> 8) & 0xFF);
+        bytes.push_back(rdlength & 0xFF);
+        
+        // 6. RDATA（变长）
+        // A 记录: 4 字节 IPv4 地址
+        // 示例: 8.8.8.8 -> [0x08, 0x08, 0x08, 0x08]
+        bytes.insert(bytes.end(), rdata.begin(), rdata.end());
+        
+        return bytes;
+    }
+};
+
+/**
  * DNS 消息结构体
  * 包含 header、question、answer、authority、additional 五个部分
  */
@@ -256,7 +331,8 @@ struct DNSMessage
 {
     DNSHeader header;
     std::vector<DNSQuestion> questions;  // Question 部分（可包含多个问题）
-    // TODO: 后续添加 answer, authority, additional 部分
+    std::vector<DNSAnswer> answers;      // Answer 部分（可包含多个回答）
+    // TODO: 后续添加 authority, additional 部分
     
     std::vector<uint8_t> serialize() const 
     {
@@ -268,6 +344,13 @@ struct DNSMessage
         {
             std::vector<uint8_t> questionBytes = question.serialize();
             bytes.insert(bytes.end(), questionBytes.begin(), questionBytes.end());
+        }
+        
+        // 3. 序列化所有 Answers
+        for (const auto& answer : answers) 
+        {
+            std::vector<uint8_t> answerBytes = answer.serialize();
+            bytes.insert(bytes.end(), answerBytes.begin(), answerBytes.end());
         }
         
         return bytes;
@@ -401,7 +484,7 @@ int main()
                                 (z << 4) | rcode;
         
         response.header.qdcount = 1;    // 问题数：1
-        response.header.ancount = 0;    // 回答数：0
+        response.header.ancount = 1;    // 回答数：1（本阶段需要返回 answer）
         response.header.nscount = 0;    // 授权记录数：0
         response.header.arcount = 0;    // 附加记录数：0
         
@@ -411,6 +494,18 @@ int main()
         question.type = 1;                   // TYPE = 1 (A 记录)
         question.qclass = 1;                 // CLASS = 1 (IN，互联网)
         response.questions.push_back(question);
+        
+        // ===== 添加 Answer =====
+        DNSAnswer answer;
+        answer.name = "codecrafters.io";    // 域名（与 Question 相同）
+        answer.type = 1;                     // TYPE = 1 (A 记录)
+        answer.aclass = 1;                   // CLASS = 1 (IN，互联网)
+        answer.ttl = 60;                     // TTL = 60 秒
+        answer.rdlength = 4;                 // RDATA 长度 = 4 字节（IPv4 地址）
+        // RDATA: IP 地址 8.8.8.8
+        // 每个数字占 1 字节: [8, 8, 8, 8] = [0x08, 0x08, 0x08, 0x08]
+        answer.rdata = {8, 8, 8, 8};
+        response.answers.push_back(answer);
         
         // ===== 序列化响应 =====
         std::vector<uint8_t> responseBytes = response.serialize();
