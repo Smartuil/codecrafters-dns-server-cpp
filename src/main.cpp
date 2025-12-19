@@ -295,6 +295,101 @@ struct DNSQuestion
     uint16_t qclass;     // 记录类别（1 = IN，互联网）
     
     /**
+     * 从字节数组解析 DNS Question（反序列化）
+     * 
+     * @param data 原始字节数据（从 Question 部分开始，即 Header 之后的第 12 字节）
+     * @param offset [输入/输出] 当前解析位置，解析完成后更新为下一个位置
+     * @return 解析后的 DNSQuestion
+     * 
+     * ============================================================
+     * 完整解析示例：假设收到以下 Question 数据
+     * ============================================================
+     * 
+     * 原始字节（从 offset=12 开始，即 Header 之后）：
+     *   索引: [12]  [13] [14] [15] [16] [17] [18] [19] [20] [21] [22] [23] [24] [25] [26] [27] [28] [29] [30] [31] [32] [33]
+     *   数据: 0x0C  'c'  'o'  'd'  'e'  'c'  'r'  'a'  'f'  't'  'e'  'r'  's'  0x02 'i'  'o'  0x00 0x00 0x01 0x00 0x01
+     *         |--- 长度=12 ---|----------- "codecrafters" ------------|--- 长度=2 ---|-- "io" --|结束|-- TYPE --|-- CLASS -|
+     * 
+     * ---------- 1. 解析域名（标签序列）----------
+     * 
+     *   步骤 1: 读取 data[12] = 0x0C = 12（第一个标签长度）
+     *           读取接下来 12 个字节: "codecrafters"
+     *           name = "codecrafters"
+     *   
+     *   步骤 2: 读取 data[25] = 0x02 = 2（第二个标签长度）
+     *           读取接下来 2 个字节: "io"
+     *           name = "codecrafters.io"
+     *   
+     *   步骤 3: 读取 data[28] = 0x00（结束符）
+     *           域名解析完成
+     *           offset 更新为 29
+     * 
+     * ---------- 2. 解析 TYPE（2 字节）----------
+     * 
+     *   data[29] = 0x00, data[30] = 0x01
+     *   type = (0x00 << 8) | 0x01 = 1 (A 记录)
+     *   offset 更新为 31
+     * 
+     * ---------- 3. 解析 CLASS（2 字节）----------
+     * 
+     *   data[31] = 0x00, data[32] = 0x01
+     *   qclass = (0x00 << 8) | 0x01 = 1 (IN 互联网)
+     *   offset 更新为 33
+     * 
+     * ============================================================
+     * 最终解析结果
+     * ============================================================
+     *   name   = "codecrafters.io"
+     *   type   = 1 (A 记录)
+     *   qclass = 1 (IN)
+     *   offset = 33 (指向下一个 Question 或 Answer 的起始位置)
+     */
+    static DNSQuestion parse(const uint8_t* data, size_t& offset)
+    {
+        DNSQuestion question;
+        
+        // ========== 解析域名（标签序列）==========
+        // 域名格式: <长度><标签内容><长度><标签内容>...<0x00>
+        std::string name;
+        while (true)
+        {
+            // 读取标签长度
+            uint8_t labelLen = data[offset];
+            offset++;
+            
+            // 长度为 0 表示域名结束
+            if (labelLen == 0)
+            {
+                break;
+            }
+            
+            // 如果不是第一个标签，添加分隔符 '.'
+            if (!name.empty())
+            {
+                name += '.';
+            }
+            
+            // 读取标签内容
+            for (uint8_t i = 0; i < labelLen; i++)
+            {
+                name += static_cast<char>(data[offset]);
+                offset++;
+            }
+        }
+        question.name = name;
+        
+        // ========== 解析 TYPE（2 字节，大端序）==========
+        question.type = (static_cast<uint16_t>(data[offset]) << 8) | data[offset + 1];
+        offset += 2;
+        
+        // ========== 解析 CLASS（2 字节，大端序）==========
+        question.qclass = (static_cast<uint16_t>(data[offset]) << 8) | data[offset + 1];
+        offset += 2;
+        
+        return question;
+    }
+    
+    /**
      * 将域名编码为 DNS 标签序列
      * 
      * 编码规则：
@@ -613,7 +708,14 @@ int main()
 
         // ---------- 5.2 解析请求并构建 DNS 响应 ----------
         // 首先解析请求的 Header
-        DNSHeader requestHeader = DNSHeader::parse(reinterpret_cast<uint8_t*>(buffer));
+        const uint8_t* requestData = reinterpret_cast<uint8_t*>(buffer);
+        DNSHeader requestHeader = DNSHeader::parse(requestData);
+        
+        // 解析 Question 部分（从 offset=12 开始，即 Header 之后）
+        size_t offset = 12;  // DNS Header 固定 12 字节
+        DNSQuestion requestQuestion = DNSQuestion::parse(requestData, offset);
+        
+        std::cout << "Query for domain: " << requestQuestion.name << std::endl;
         
         // 使用 DNSMessage 统一管理响应
         DNSMessage response;
@@ -649,20 +751,20 @@ int main()
         response.header.nscount = 0;    // 授权记录数：0
         response.header.arcount = 0;    // 附加记录数：0
         
-        // ===== 添加 Question =====
+        // ===== 添加 Question（从请求中复制）=====
         DNSQuestion question;
-        question.name = "codecrafters.io";  // 域名
-        question.type = 1;                   // TYPE = 1 (A 记录)
-        question.qclass = 1;                 // CLASS = 1 (IN，互联网)
+        question.name = requestQuestion.name;    // 使用解析到的域名
+        question.type = 1;                       // TYPE = 1 (A 记录)
+        question.qclass = 1;                     // CLASS = 1 (IN，互联网)
         response.questions.push_back(question);
         
-        // ===== 添加 Answer =====
+        // ===== 添加 Answer（使用解析到的域名）=====
         DNSAnswer answer;
-        answer.name = "codecrafters.io";    // 域名（与 Question 相同）
-        answer.type = 1;                     // TYPE = 1 (A 记录)
-        answer.aclass = 1;                   // CLASS = 1 (IN，互联网)
-        answer.ttl = 60;                     // TTL = 60 秒
-        answer.rdlength = 4;                 // RDATA 长度 = 4 字节（IPv4 地址）
+        answer.name = requestQuestion.name;      // 域名（与 Question 相同）
+        answer.type = 1;                         // TYPE = 1 (A 记录)
+        answer.aclass = 1;                       // CLASS = 1 (IN，互联网)
+        answer.ttl = 60;                         // TTL = 60 秒
+        answer.rdlength = 4;                     // RDATA 长度 = 4 字节（IPv4 地址）
         // RDATA: IP 地址 8.8.8.8
         // 每个数字占 1 字节: [8, 8, 8, 8] = [0x08, 0x08, 0x08, 0x08]
         answer.rdata = {8, 8, 8, 8};
